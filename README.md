@@ -14,7 +14,7 @@
 - сохранение отчётов и логов.
 ## Требования
 - Windows 10/11;
-- Python 3.9 или новее.
+- Python 3.11 или новее.
 ## Установка
 ```cmd
 git clone https://github.com/USERNAME/pc-optimizer.git
