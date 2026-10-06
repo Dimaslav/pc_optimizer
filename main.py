@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-PC Optimizer + Disk Scanner — объединённая программа.
-
-Возможности:
-  • Сканер диска: рекурсивный анализ с категоризацией, деревом папок,
-    поиском/фильтрацией и таблицей файлов.
-  • Анализ размеров подпапок с диаграммой.
-  • Очистка системного мусора (Temp, кэши браузеров/игр, эскизы, Recent).
-  • Очистка корзины (WinAPI / gio) и DNS.
-  • Поиск дубликатов (частичный + полный SHA-256).
-  • Поиск больших файлов.
-  • Автозагрузка (Windows: реестр + Startup-папки) с бэкапом.
-  • Процессы (psutil).
-  • Безопасный режим с защитой системных путей/расширений.
-  • Экспорт CSV / TXT / JSON-отчётов.
-"""
-
 from __future__ import annotations
 
 import base64
@@ -46,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QAbstractTableModel, QModelIndex,
     QSortFilterProxyModel, QSettings, QUrl, QPoint, QTimer,
+    QSharedMemory, QLockFile,
 )
 from PyQt6.QtGui import (
     QDesktopServices, QFont, QAction, QKeySequence,
@@ -83,14 +65,13 @@ except ImportError:
 #  КОНСТАНТЫ
 # ============================================================================
 APP_NAME = "PC Optimizer + Disk Scanner"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 ORG_NAME = "DiskTools"
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 IS_MAC = platform.system() == "Darwin"
 
-BASE_DIR = Path(__file__).resolve().parent
 APP_DATA_DIR = Path.home() / ".pc_optimizer"
 CONFIG_DIR = APP_DATA_DIR / "config"
 LOG_DIR = APP_DATA_DIR / "logs"
@@ -103,8 +84,6 @@ for _d in (APP_DATA_DIR, CONFIG_DIR, LOG_DIR, REPORT_DIR, STARTUP_BACKUP_DIR):
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 STARTUP_BACKUP_FILE = CONFIG_DIR / "startup_backups.json"
 LOG_FILE = LOG_DIR / "pc_optimizer.log"
-
-RECYCLE_BIN_MARKER = "__RECYCLE_BIN__"
 
 # --- Категории файлов (для сканера диска) -----------------------------------
 CATEGORIES: Dict[str, set] = {
@@ -141,7 +120,16 @@ _PROGRESS_FILE_INTERVAL = 200
 _PROGRESS_TIME_INTERVAL = 0.2
 
 STARTUP_RUN_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-MUTEX_NAME = r"Local\PCOptimizer_Combined"
+
+# Критические процессы, которые нельзя завершать
+CRITICAL_PROCESS_NAMES = {
+    "system", "system idle process", "registry", "memory compression",
+    "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
+    "lsass.exe", "svchost.exe", "explorer.exe", "dwm.exe", "fontdrvhost.exe",
+    "sihost.exe", "taskhostw.exe", "ctfmon.exe", "audiodg.exe",
+    "init", "systemd", "kthreadd", "kworker", "ksoftirqd", "migration",
+    "watchdog", "launchd", "kernel_task",
+}
 
 
 # ============================================================================
@@ -155,6 +143,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+log = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -187,7 +176,14 @@ def normalize_path(path: str) -> str:
         return ""
     path = str(path).strip().strip('"')
     path = os.path.expandvars(os.path.expanduser(path))
-    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    try:
+        p = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    except (OSError, ValueError):
+        return ""
+    # Убираем trailing separator, кроме корня диска
+    if len(p) > 1 and p.endswith(os.sep) and not (len(p) == 3 and p[1] == ":"):
+        p = p.rstrip(os.sep)
+    return p
 
 
 def normalize_paths(paths: List[str]) -> List[str]:
@@ -205,11 +201,17 @@ def classify_file(path: str) -> str:
     return EXT_TO_CATEGORY.get(Path(path).suffix.lower(), OTHER_CATEGORY)
 
 
-def is_child_of(child_norm: str, parent_norm: str) -> bool:
-    if child_norm == parent_norm:
-        return True
-    prefix = parent_norm.rstrip(os.sep) + os.sep
-    return child_norm.startswith(prefix)
+def is_inside(path: str, root: str, allow_equal: bool = False) -> bool:
+    path, root = normalize_path(path), normalize_path(root)
+    if not path or not root:
+        return False
+    if path == root:
+        return allow_equal
+    try:
+        common = os.path.commonpath([path, root])
+    except ValueError:
+        return False
+    return common == root
 
 
 def path_depth(display: str, root: str) -> int:
@@ -235,12 +237,10 @@ def get_user_profile() -> str:
     return normalize_path(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
 
 
-def get_windows_dir() -> str:
-    return normalize_path(os.environ.get("WINDIR", r"C:\Windows"))
-
-
 def get_system_drive() -> str:
-    return normalize_path(os.environ.get("SystemDrive", "C:") + "\\")
+    if IS_WINDOWS:
+        return normalize_path(os.environ.get("SystemDrive", "C:") + "\\")
+    return "/"
 
 
 def get_desktop() -> str:
@@ -252,7 +252,9 @@ def open_in_explorer(path: str) -> None:
     try:
         if IS_WINDOWS:
             if os.path.isfile(path):
-                subprocess.run(["explorer", "/select,", os.path.normpath(path)])
+                # Explorer ожидает /select,"C:\path" одним аргументом
+                subprocess.run(["explorer", f"/select,{os.path.normpath(path)}"],
+                               check=False)
             else:
                 os.startfile(path)  # noqa
         elif IS_MAC:
@@ -264,6 +266,7 @@ def open_in_explorer(path: str) -> None:
             folder = path if os.path.isdir(path) else os.path.dirname(path)
             subprocess.Popen(["xdg-open", folder])
     except Exception:
+        log.exception("open_in_explorer failed for %r", path)
         folder = path if os.path.isdir(path) else os.path.dirname(path)
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
@@ -277,30 +280,37 @@ def is_drive_root(path: str) -> bool:
 def is_reparse_point(path: str) -> bool:
     if not os.path.lexists(path):
         return False
-    if os.path.islink(path):
-        return True
+    try:
+        if os.path.islink(path):
+            return True
+    except OSError:
+        return False
     if not IS_WINDOWS:
         return False
     try:
         attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
         if attrs == 0xFFFFFFFF:
             return False
-        return bool(attrs & 0x0400)
+        return bool(attrs & 0x0400)  # FILE_ATTRIBUTE_REPARSE_POINT
     except Exception:
         return False
 
 
-def is_inside(path: str, root: str, allow_equal: bool = False) -> bool:
-    path, root = normalize_path(path), normalize_path(root)
-    if not path or not root:
+def entry_is_reparse(entry: os.DirEntry) -> bool:
+    """Проверка reparse/junction без лишних системных вызовов на Windows."""
+    try:
+        if entry.is_symlink():
+            return True
+    except OSError:
+        return True
+    if not IS_WINDOWS:
         return False
     try:
-        common = os.path.commonpath([path, root])
-    except ValueError:
-        return False
-    if path == root:
-        return allow_equal
-    return common == root
+        st = entry.stat(follow_symlinks=False)
+        attr = getattr(st, "st_file_attributes", 0)
+        return bool(attr & 0x0400)
+    except OSError:
+        return True
 
 
 def run_command(arguments: List[str], timeout: int = 60) -> Dict[str, Any]:
@@ -319,25 +329,27 @@ def run_command(arguments: List[str], timeout: int = 60) -> Dict[str, Any]:
         return {"success": False, "returncode": -1, "stdout": "",
                 "stderr": "Превышено время ожидания"}
     except Exception as exc:
-        logging.exception("Ошибка команды: %r", arguments)
+        log.exception("Ошибка команды: %r", arguments)
         return {"success": False, "returncode": -1, "stdout": "", "stderr": str(exc)}
 
 
 # ============================================================================
-#  КЭШИ ЗАЩИТЫ (объявлены ДО Settings, чтобы Settings.load() мог их сбросить)
+#  КЭШИ ЗАЩИТЫ
 # ============================================================================
-_EXT_CACHE: Optional[set] = None
-_ALLOW_CACHE: Optional[set] = None
+_EXT_CACHE: Optional[frozenset] = None
+_ALLOW_CACHE: Optional[frozenset] = None
+_CACHE_LOCK = threading.RLock()
 
 
 def _invalidate_protection_cache() -> None:
     global _EXT_CACHE, _ALLOW_CACHE
-    _EXT_CACHE = None
-    _ALLOW_CACHE = None
+    with _CACHE_LOCK:
+        _EXT_CACHE = None
+        _ALLOW_CACHE = None
 
 
 # ============================================================================
-#  НАСТРОЙКИ
+#  НАСТРОЙКИ (потокобезопасные)
 # ============================================================================
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "appearance": "dark",
@@ -353,45 +365,99 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "geometry": None,
     "window_state": None,
     "last_scan_path": "",
+    "ignore_dirs": ["$recycle.bin", "system volume information", "windowsapps"],
 }
+
+_LIST_OF_STR_KEYS = {"keep_extensions", "custom_protected", "ignore_dirs"}
+
+
+def _normalize_extension(ext: str) -> str:
+    ext = str(ext).strip().lower()
+    if not ext:
+        return ""
+    if not ext.startswith("."):
+        ext = "." + ext
+    return ext
 
 
 class Settings:
+    """Потокобезопасное хранилище настроек."""
+
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self.data: Dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS)
         self.load()
 
+    # ------------------------------------------------------------- load/save
     def load(self) -> None:
+        loaded: Dict[str, Any] = {}
         try:
             if CONFIG_FILE.exists():
                 with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
                     loaded = json.load(fh)
-                if isinstance(loaded, dict):
-                    for k, v in loaded.items():
-                        if k in DEFAULT_SETTINGS:
-                            self.data[k] = v
+                if not isinstance(loaded, dict):
+                    loaded = {}
         except Exception:
-            logging.exception("Не удалось загрузить настройки")
+            log.exception("Не удалось загрузить настройки")
+            loaded = {}
+
+        with self._lock:
+            for k, default_v in DEFAULT_SETTINGS.items():
+                v = loaded.get(k, default_v)
+                v = self._coerce(k, v, default_v)
+                self.data[k] = v
         _invalidate_protection_cache()
 
+    @staticmethod
+    def _coerce(key: str, value: Any, default: Any) -> Any:
+        try:
+            if key in _LIST_OF_STR_KEYS:
+                if not isinstance(value, list):
+                    return list(default)
+                if key == "keep_extensions":
+                    normalized = [_normalize_extension(x) for x in value]
+                    normalized = [x for x in normalized if x]
+                    return normalized or list(default)  # запрет пустого списка
+                return [str(x) for x in value if str(x).strip()]
+            if isinstance(default, bool):
+                return bool(value)
+            if isinstance(default, int) and not isinstance(default, bool):
+                return int(value)
+            if isinstance(default, float):
+                return float(value)
+            if isinstance(default, str):
+                return str(value)
+            return value
+        except (TypeError, ValueError):
+            return copy.deepcopy(default)
+
     def save(self) -> bool:
+        with self._lock:
+            snapshot = copy.deepcopy(self.data)
         try:
             tmp = str(CONFIG_FILE) + ".tmp"
             with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-                json.dump(self.data, fh, ensure_ascii=False, indent=2)
+                json.dump(snapshot, fh, ensure_ascii=False, indent=2)
             os.replace(tmp, CONFIG_FILE)
             return True
         except Exception:
-            logging.exception("Не удалось сохранить настройки")
+            log.exception("Не удалось сохранить настройки")
             return False
 
+    # ------------------------------------------------------------- accessors
     def __getitem__(self, key):
-        return self.data.get(key, DEFAULT_SETTINGS.get(key))
+        with self._lock:
+            return self.data.get(key, DEFAULT_SETTINGS.get(key))
 
     def __setitem__(self, key, value):
-        self.data[key] = value
-        if key in ("keep_extensions", "custom_protected"):
+        with self._lock:
+            self.data[key] = value
+        if key in _LIST_OF_STR_KEYS:
             _invalidate_protection_cache()
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self.data)
 
 
 SETTINGS = Settings()
@@ -400,7 +466,7 @@ SETTINGS = Settings()
 # ============================================================================
 #  ЗАЩИТА СИСТЕМНЫХ ФАЙЛОВ
 # ============================================================================
-def _get_system_roots() -> set:
+def _get_system_roots() -> Set[str]:
     if IS_WINDOWS:
         win = os.environ.get("SystemRoot", r"C:\Windows")
         return {
@@ -426,39 +492,48 @@ def _get_system_roots() -> set:
     return set()
 
 
-SYSTEM_ROOTS = {normalize_path(p) for p in _get_system_roots()}
+SYSTEM_ROOTS = frozenset(normalize_path(p) for p in _get_system_roots() if p)
+SYSTEM_ROOTS = frozenset(p for p in SYSTEM_ROOTS if p)
 
 PROTECTED_NAMES = {
-    "desktop.ini", "thumbs.db", "bootmgr", "ntldr", "pagefile.sys",
+    "desktop.ini", "bootmgr", "ntldr", "pagefile.sys",
     "hiberfil.sys", "swapfile.sys", "ntuser.dat", "ntuser.ini",
-    "boot.ini", "bcd", "autorun.inf", ".ds_store", ".gitignore",
+    "boot.ini", "bcd", "autorun.inf", ".ds_store",
     "fstab", "passwd", "shadow", "hosts", "sudoers",
 }
 
 
-def _get_protected_exts() -> set:
+def _get_protected_exts() -> frozenset:
     global _EXT_CACHE
-    if _EXT_CACHE is None:
-        _EXT_CACHE = {str(e).lower() for e in SETTINGS["keep_extensions"]}
-    return _EXT_CACHE
+    with _CACHE_LOCK:
+        if _EXT_CACHE is None:
+            _EXT_CACHE = frozenset(
+                _normalize_extension(e) for e in SETTINGS["keep_extensions"]
+                if _normalize_extension(e)
+            )
+        return _EXT_CACHE
 
 
-def _get_allow_paths() -> set:
+def _get_allow_paths() -> frozenset:
     global _ALLOW_CACHE
-    if _ALLOW_CACHE is not None:
+    with _CACHE_LOCK:
+        if _ALLOW_CACHE is not None:
+            return _ALLOW_CACHE
+        allow: Set[str] = set()
+        if IS_WINDOWS:
+            win = os.environ.get("SystemRoot", r"C:\Windows")
+            for sub in ("Temp", "Prefetch", "Logs", "SoftwareDistribution"):
+                p = normalize_path(os.path.join(win, sub))
+                if p:
+                    allow.add(p)
+            allow.add(normalize_path(r"C:\$Recycle.Bin"))
+        elif IS_LINUX:
+            allow.update({normalize_path(p) for p in ("/tmp", "/var/tmp") if p})
+        elif IS_MAC:
+            allow.add(normalize_path("/tmp"))
+        allow.discard("")
+        _ALLOW_CACHE = frozenset(allow)
         return _ALLOW_CACHE
-    allow: Set[str] = set()
-    if IS_WINDOWS:
-        win = os.environ.get("SystemRoot", r"C:\Windows")
-        for sub in ("Temp", "Prefetch", "Logs", "SoftwareDistribution"):
-            allow.add(normalize_path(os.path.join(win, sub)))
-        allow.add(normalize_path(r"C:\$Recycle.Bin"))
-    elif IS_LINUX:
-        allow.update({normalize_path(p) for p in ("/tmp", "/var/tmp")})
-    elif IS_MAC:
-        allow.add(normalize_path("/tmp"))
-    _ALLOW_CACHE = allow
-    return allow
 
 
 def is_protected(path: str) -> Tuple[bool, str]:
@@ -466,21 +541,27 @@ def is_protected(path: str) -> Tuple[bool, str]:
         ap = normalize_path(path)
     except Exception:
         return True, "невалидный путь"
+    if not ap:
+        return True, "невалидный путь"
 
-    for cp in SETTINGS["custom_protected"]:
+    custom = SETTINGS["custom_protected"]
+    for cp in custom:
         try:
             cpn = normalize_path(cp)
-            if ap == cpn or ap.startswith(cpn + os.sep):
-                return True, "пользовательская защита"
         except Exception:
             continue
+        if not cpn:
+            continue
+        if ap == cpn or is_inside(ap, cpn, allow_equal=False):
+            return True, "пользовательская защита"
 
     allow_paths = _get_allow_paths()
-    is_allowed = any(ap == a or ap.startswith(a + os.sep) for a in allow_paths)
+    is_allowed = any(ap == a or is_inside(ap, a, allow_equal=False)
+                     for a in allow_paths)
 
     if not is_allowed:
         for root in SYSTEM_ROOTS:
-            if ap == root or ap.startswith(root + os.sep):
+            if ap == root or is_inside(ap, root, allow_equal=False):
                 return True, "системная папка"
 
     name = os.path.basename(ap).lower()
@@ -488,36 +569,40 @@ def is_protected(path: str) -> Tuple[bool, str]:
         return True, "критический файл"
 
     ext = os.path.splitext(name)[1].lower()
-    if ext in _get_protected_exts():
+    if ext and ext in _get_protected_exts():
         return True, f"защищённое расширение {ext}"
 
     if IS_WINDOWS and not is_allowed:
         try:
             attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-            if attrs != -1 and (attrs & 0x4):
+            if attrs not in (-1, 0xFFFFFFFF) and (attrs & 0x4):
                 return True, "атрибут SYSTEM"
         except Exception:
             pass
 
-    if os.path.islink(path):
-        return True, "символическая ссылка"
+    try:
+        if os.path.islink(path):
+            return True, "символическая ссылка"
+    except OSError:
+        pass
 
     return False, ""
 
 
 def validate_delete_path(path: str, root: str) -> Tuple[bool, str]:
-    path, root = normalize_path(path), normalize_path(root)
-    if not path or not root:
+    p = normalize_path(path)
+    r = normalize_path(root)
+    if not p or not r:
         return False, "Пустой путь"
-    if is_drive_root(path):
+    if is_drive_root(p):
         return False, "Корень диска защищён"
-    if path == root:
+    if p == r:
         return False, "Корень категории защищён"
-    if not is_inside(path, root):
+    if not is_inside(p, r, allow_equal=False):
         return False, "Путь вне разрешённой папки"
-    if is_reparse_point(path):
+    if is_reparse_point(p):
         return False, "Ссылки и reparse points запрещены"
-    prot, reason = is_protected(path)
+    prot, reason = is_protected(p)
     if prot:
         return False, reason
     return True, ""
@@ -635,6 +720,8 @@ def scan_disk(
 ) -> ScanResult:
     root_display = os.path.normpath(os.path.abspath(os.path.expanduser(root_path)))
     root_key = normalize_path(root_display)
+    if not root_key:
+        raise ValueError(f"Невалидный путь: {root_path!r}")
 
     files: List[FileInfo] = []
     folder_stats: Dict[str, FolderStats] = {
@@ -680,11 +767,14 @@ def scan_disk(
             if _should_stop():
                 raise ScanCanceled()
             try:
-                if entry.is_symlink():
+                # Пропускаем symlinks и junction/reparse points
+                if entry_is_reparse(entry):
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     child_display = os.path.normpath(entry.path)
                     child_key = normalize_path(child_display)
+                    if not child_key:
+                        continue
                     if child_key not in folder_stats:
                         folder_stats[child_key] = FolderStats(
                             display=child_display, parent_key=dir_key
@@ -703,6 +793,8 @@ def scan_disk(
             mtime = st.st_mtime
             category = classify_file(full_path)
             norm = normalize_path(full_path)
+            if not norm:
+                continue
 
             files.append(FileInfo(
                 path=full_path,
@@ -725,15 +817,18 @@ def scan_disk(
 
             _emit(full_path)
 
+    # Агрегация размеров вверх по дереву
     sorted_keys = sorted(
         folder_stats,
         key=lambda k: path_depth(folder_stats[k].display, root_display),
         reverse=True,
     )
     for key in sorted_keys:
+        if key == root_key:
+            continue
         stats = folder_stats[key]
         pk = stats.parent_key
-        if pk and pk in folder_stats:
+        if pk and pk in folder_stats and pk != key:
             folder_stats[pk].count += stats.count
             folder_stats[pk].size_bytes += stats.size_bytes
 
@@ -790,7 +885,7 @@ def browser_cache_roots() -> List[str]:
         try:
             for entry in os.scandir(base):
                 if (entry.is_dir(follow_symlinks=False)
-                        and not is_reparse_point(entry.path)
+                        and not entry_is_reparse(entry)
                         and profile_pattern.match(entry.name)):
                     result.extend([
                         os.path.join(entry.path, "Cache"),
@@ -805,7 +900,7 @@ def browser_cache_roots() -> List[str]:
     if os.path.isdir(firefox):
         try:
             for entry in os.scandir(firefox):
-                if entry.is_dir(follow_symlinks=False) and not is_reparse_point(entry.path):
+                if entry.is_dir(follow_symlinks=False) and not entry_is_reparse(entry):
                     result.extend([
                         os.path.join(entry.path, "cache2"),
                         os.path.join(entry.path, "startupCache"),
@@ -813,7 +908,8 @@ def browser_cache_roots() -> List[str]:
         except OSError:
             pass
 
-    result.append(os.path.join(user, "AppData", "Local", "Microsoft", "Windows", "INetCache"))
+    result.append(os.path.join(user, "AppData", "Local", "Microsoft",
+                                "Windows", "INetCache"))
     return normalize_paths(result)
 
 
@@ -826,19 +922,21 @@ def game_cache_roots() -> List[str]:
         os.path.join(user, "AppData", "Roaming", "discord", "Cache"),
         os.path.join(user, "AppData", "Roaming", "discord", "Code Cache"),
         os.path.join(user, "AppData", "Roaming", "discord", "GPUCache"),
-        os.path.join(user, "AppData", "Local", "EpicGamesLauncher", "Saved", "webcache"),
+        os.path.join(user, "AppData", "Local", "EpicGamesLauncher", "Saved",
+                     "webcache"),
         os.path.join(user, "AppData", "Local", "Battle.net", "Cache"),
     ])
 
 
 def category_roots(category: str) -> List[str]:
-    return {
+    fn = {
         "temp": temp_roots,
         "thumbnails": thumbnail_roots,
         "privacy": browser_cache_roots,
         "games": game_cache_roots,
         "recent": recent_roots,
-    }.get(category, lambda: [])()
+    }.get(category)
+    return fn() if fn else []
 
 
 def category_accepts(category: str, path: str) -> bool:
@@ -847,39 +945,6 @@ def category_accepts(category: str, path: str) -> bool:
     name = os.path.basename(path).lower()
     return name.endswith(".db") and (name.startswith("thumbcache")
                                      or name.startswith("iconcache"))
-
-
-def get_junk_paths() -> List[Tuple[str, str]]:
-    home = os.path.expanduser("~")
-    if IS_WINDOWS:
-        local = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
-        win = os.environ.get("SystemRoot", r"C:\Windows")
-        return [
-            ("Временные файлы пользователя", os.path.join(local, "Temp")),
-            ("Временные файлы Windows", os.path.join(win, "Temp")),
-            ("Prefetch", os.path.join(win, "Prefetch")),
-            ("Кэш Windows Update", os.path.join(win, "SoftwareDistribution", "Download")),
-            ("Корзина", RECYCLE_BIN_MARKER),
-            ("Отчёты об ошибках", os.path.join(local, "Microsoft", "Windows", "WER")),
-            ("Кэш эскизов", os.path.join(local, "Microsoft", "Windows", "Explorer")),
-            ("Временные интернет-файлы", os.path.join(local, "Microsoft", "Windows", "INetCache")),
-            ("Логи Windows", os.path.join(win, "Logs")),
-        ]
-    if IS_LINUX:
-        return [
-            ("/tmp", "/tmp"),
-            ("/var/tmp", "/var/tmp"),
-            ("Кэш пользователя", os.path.join(home, ".cache")),
-            ("Корзина", RECYCLE_BIN_MARKER),
-        ]
-    if IS_MAC:
-        return [
-            ("Кэш пользователя", os.path.join(home, "Library", "Caches")),
-            ("Логи", os.path.join(home, "Library", "Logs")),
-            ("Временные файлы", "/tmp"),
-            ("Корзина", RECYCLE_BIN_MARKER),
-        ]
-    return []
 
 
 # ============================================================================
@@ -912,7 +977,7 @@ def scan_cleanup(categories: List[str], min_age_hours: int,
                             if token.cancelled():
                                 break
                             try:
-                                if entry.is_symlink() or is_reparse_point(entry.path):
+                                if entry_is_reparse(entry):
                                     continue
                                 if entry.is_dir(follow_symlinks=False):
                                     stack.append(entry.path)
@@ -932,7 +997,8 @@ def scan_cleanup(categories: List[str], min_age_hours: int,
                                     continue
                                 candidates[normalize_path(entry.path)] = Candidate(
                                     category=category, path=entry.path, root=root,
-                                    size=int(info.st_size), modified=float(info.st_mtime),
+                                    size=int(info.st_size),
+                                    modified=float(info.st_mtime),
                                 )
                             except (OSError, PermissionError, FileNotFoundError):
                                 continue
@@ -941,6 +1007,21 @@ def scan_cleanup(categories: List[str], min_age_hours: int,
     result = list(candidates.values())
     result.sort(key=lambda c: c.size, reverse=True)
     return result
+
+
+def _make_writable(path: str) -> None:
+    """Корректно снимает read-only на файле, не ломая остальные биты."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    mode = st.st_mode
+    if mode & stat.S_IWRITE:
+        return
+    try:
+        os.chmod(path, mode | stat.S_IWRITE)
+    except OSError:
+        pass
 
 
 def delete_candidates(candidates: List[Candidate], token: CancelToken,
@@ -959,15 +1040,14 @@ def delete_candidates(candidates: List[Candidate], token: CancelToken,
         valid, reason = validate_delete_path(c.path, c.root)
         if not valid:
             result.skipped += 1
+            result.details.append({"path": c.path, "success": False,
+                                   "error": reason})
             continue
         try:
             if not os.path.isfile(c.path):
                 result.skipped += 1
                 continue
-            try:
-                os.chmod(c.path, stat.S_IWRITE)
-            except OSError:
-                pass
+            _make_writable(c.path)
             size = os.path.getsize(c.path)
             os.remove(c.path)
             result.deleted += 1
@@ -1011,19 +1091,23 @@ def drive_letters() -> List[str]:
         mask = ctypes.windll.kernel32.GetLogicalDrives()
         for letter in string.ascii_uppercase:
             if mask & 1:
-                path = f"{letter}:\\"
-                if os.path.exists(path):
-                    result.append(path)
+                try:
+                    dtype = ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:\\")
+                except Exception:
+                    dtype = 3
+                if dtype in (2, 3):
+                    result.append(f"{letter}:\\")
             mask >>= 1
     except Exception:
-        logging.exception("Ошибка получения дисков")
+        log.exception("Ошибка получения дисков")
     return result
 
 
-def recycle_size() -> int:
+def recycle_size() -> Tuple[int, int]:
+    """Возвращает (размер, количество)."""
     if not IS_WINDOWS:
-        return 0
-    total = 0
+        return 0, 0
+    total, items = 0, 0
     for drive in drive_letters():
         try:
             info = SHQUERYRBINFO()
@@ -1033,23 +1117,24 @@ def recycle_size() -> int:
             )
             if code == 0:
                 total += int(info.i64Size)
+                items += int(info.i64NumItems)
         except Exception:
             continue
-    return total
+    return total, items
 
 
 def empty_recycle_bin() -> OperationResult:
     result = OperationResult()
-    expected = recycle_size() if IS_WINDOWS else 0
+    size, items = recycle_size() if IS_WINDOWS else (0, 0)
 
     if IS_WINDOWS:
         try:
             flags = 0x1 | 0x2 | 0x4
             code = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
             if code == 0:
-                result.deleted = 1 if expected else 0
-                result.bytes_freed = expected
-                result.message = "Корзина очищена"
+                result.deleted = items
+                result.bytes_freed = size
+                result.message = f"Корзина очищена ({items} элементов)"
             else:
                 result.status = "failed"
                 result.errors = 1
@@ -1062,7 +1147,8 @@ def empty_recycle_bin() -> OperationResult:
 
     if IS_LINUX:
         try:
-            r = subprocess.run(["gio", "trash", "--empty"], capture_output=True, timeout=30)
+            r = subprocess.run(["gio", "trash", "--empty"],
+                               capture_output=True, timeout=30)
             if r.returncode == 0:
                 result.message = "Корзина очищена"
                 return result
@@ -1136,14 +1222,11 @@ def flush_dns() -> OperationResult:
         result.message = cmd.get("stderr") or cmd.get("stdout") or "Ошибка"
     return result
 
-
-# ============================================================================
-#  ДУБЛИКАТЫ / БОЛЬШИЕ ФАЙЛЫ / РАЗМЕРЫ ПАПОК
-# ============================================================================
 def _iter_files(roots: List[str], token: CancelToken,
                 progress: Callable[[str], None]):
+    """Генератор отдаёт os.DirEntry, чтобы избежать повторных stat()."""
     scanned = 0
-    ignored = {"$recycle.bin", "system volume information", "windowsapps"}
+    ignored = {str(x).lower() for x in SETTINGS["ignore_dirs"]}
     for root in normalize_paths(roots):
         if token.cancelled():
             return
@@ -1160,7 +1243,7 @@ def _iter_files(roots: List[str], token: CancelToken,
                         try:
                             if entry.name.lower() in ignored:
                                 continue
-                            if entry.is_symlink() or is_reparse_point(entry.path):
+                            if entry_is_reparse(entry):
                                 continue
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(entry.path)
@@ -1168,7 +1251,7 @@ def _iter_files(roots: List[str], token: CancelToken,
                                 scanned += 1
                                 if scanned % 500 == 0:
                                     progress(f"Проверено файлов: {scanned}")
-                                yield entry.path
+                                yield entry
                         except OSError:
                             continue
             except OSError:
@@ -1180,15 +1263,15 @@ def find_large_files(roots: List[str], min_mb: int, token: CancelToken,
     threshold = int(min_mb) * 1024 * 1024
     result: List[Dict[str, Any]] = []
     count = 0
-    for path in _iter_files(roots, token, progress):
+    for entry in _iter_files(roots, token, progress):
         if token.cancelled():
             break
         try:
-            size = os.path.getsize(path)
-            if size >= threshold:
+            st = entry.stat(follow_symlinks=False)
+            if st.st_size >= threshold:
                 result.append({
-                    "path": path, "size": size,
-                    "modified": os.path.getmtime(path),
+                    "path": entry.path, "size": st.st_size,
+                    "modified": st.st_mtime,
                 })
                 count += 1
                 if count % 20 == 0:
@@ -1204,8 +1287,11 @@ def partial_hash(path: str, size: int) -> Optional[str]:
     block = 1024 * 1024
     try:
         with open(path, "rb") as fh:
-            digest.update(fh.read(block))
-            if size > block * 2:
+            if size <= block:
+                # Файл маленький — одного чтения достаточно
+                digest.update(fh.read())
+            else:
+                digest.update(fh.read(block))
                 fh.seek(max(0, size - block))
                 digest.update(fh.read(block))
         digest.update(str(size).encode("ascii"))
@@ -1228,25 +1314,47 @@ def full_hash(path: str, token: CancelToken) -> Optional[str]:
     return None
 
 
+def _file_id(path: str) -> Optional[Tuple[int, int]]:
+    """(st_dev, st_ino) для учёта hard links."""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
 def find_duplicates(roots: List[str], min_mb: int, token: CancelToken,
                     progress: Callable[[str], None]) -> List[Dict[str, Any]]:
     threshold = int(min_mb) * 1024 * 1024
     sizes: Dict[int, List[str]] = {}
-    for path in _iter_files(roots, token, progress):
+
+    for entry in _iter_files(roots, token, progress):
         if token.cancelled():
             return []
         try:
-            size = os.path.getsize(path)
-            if size >= threshold:
-                sizes.setdefault(size, []).append(path)
+            st = entry.stat(follow_symlinks=False)
+            if st.st_size >= threshold:
+                sizes.setdefault(st.st_size, []).append(entry.path)
         except OSError:
             continue
+
+    def _dedupe_by_inode(paths: List[str]) -> List[str]:
+        seen: Set[Tuple[int, int]] = set()
+        out: List[str] = []
+        for p in paths:
+            fid = _file_id(p)
+            if fid is None or fid in seen:
+                continue
+            seen.add(fid)
+            out.append(p)
+        return out
 
     partial_groups: Dict[Tuple[int, str], List[str]] = {}
     checked = 0
     for size, paths in sizes.items():
         if token.cancelled():
             return []
+        paths = _dedupe_by_inode(paths)
         if len(paths) < 2:
             continue
         for path in paths:
@@ -1287,11 +1395,22 @@ def find_duplicates(roots: List[str], min_mb: int, token: CancelToken,
     return result[:500]
 
 
-def _dir_size(path: str, stop_flag: Callable[[], bool] = lambda: False) -> Tuple[int, int]:
+def _dir_size(path: str, stop_flag: Callable[[], bool] = lambda: False,
+              error_counter: Optional[List[int]] = None
+              ) -> Tuple[int, int]:
     total, count = 0, 0
-    for dp, _dn, fn in os.walk(path):
+    if error_counter is None:
+        error_counter = [0]
+
+    def _onerror(_e: OSError) -> None:
+        error_counter[0] += 1
+
+    for dp, dn, fn in os.walk(path, onerror=_onerror, followlinks=False):
         if stop_flag():
             break
+        # Пропускаем reparse points в подкаталогах
+        dn[:] = [d for d in dn
+                 if not is_reparse_point(os.path.join(dp, d))]
         for f in fn:
             if stop_flag():
                 break
@@ -1299,7 +1418,7 @@ def _dir_size(path: str, stop_flag: Callable[[], bool] = lambda: False) -> Tuple
                 total += os.path.getsize(os.path.join(dp, f))
                 count += 1
             except OSError:
-                pass
+                error_counter[0] += 1
     return total, count
 
 
@@ -1319,12 +1438,12 @@ def get_folder_sizes(root: str, stop_flag: Callable[[], bool] = lambda: False,
     dir_entries = []
     for e in entries:
         try:
-            if e.is_symlink():
+            if entry_is_reparse(e):
                 continue
             if e.is_dir(follow_symlinks=False):
                 dir_entries.append(e)
             elif e.is_file(follow_symlinks=False):
-                root_files_size += e.stat().st_size
+                root_files_size += e.stat(follow_symlinks=False).st_size
                 root_files_count += 1
         except OSError:
             continue
@@ -1336,7 +1455,8 @@ def get_folder_sizes(root: str, stop_flag: Callable[[], bool] = lambda: False,
         if on_progress:
             on_progress(i, total_dirs, entry.path)
         size, count = _dir_size(entry.path, stop_flag)
-        result.append(FolderSize(path=entry.path, name=entry.name, size=size, files=count))
+        result.append(FolderSize(path=entry.path, name=entry.name,
+                                 size=size, files=count))
 
     result.sort(key=lambda x: x.size, reverse=True)
     if root_files_count > 0:
@@ -1360,10 +1480,10 @@ def system_snapshot() -> Dict[str, Any]:
     try:
         cpu = psutil.cpu_percent(interval=0.15)
         memory = psutil.virtual_memory()
-        system_drive = get_system_drive() if IS_WINDOWS else "/"
+        system_drive = get_system_drive()
         disk = psutil.disk_usage(system_drive)
         score = 100
-        warnings = []
+        warnings: List[str] = []
         free_percent = disk.free * 100 / disk.total if disk.total else 0
         if free_percent < 10:
             score -= 30
@@ -1421,9 +1541,12 @@ def terminate_process(pid: int) -> Tuple[bool, str]:
         return False, "psutil не установлен"
     try:
         pid = int(pid)
-        if pid in (0, 4, os.getpid()):
+        if pid <= 4 or pid == os.getpid():
             return False, "Этот процесс завершать запрещено"
         process = psutil.Process(pid)
+        name = (process.name() or "").lower()
+        if name in CRITICAL_PROCESS_NAMES:
+            return False, f"Критический процесс: {name}"
         process.terminate()
         try:
             process.wait(4)
@@ -1526,6 +1649,7 @@ def _decode_registry_value(data: Dict[str, Any]) -> Tuple[Any, int]:
 
 
 def disable_startup(item: Dict[str, Any]) -> Tuple[bool, str]:
+    """Атомарное отключение: сначала бэкап, потом действие."""
     backups = load_json(STARTUP_BACKUP_FILE, [])
     if not isinstance(backups, list):
         backups = []
@@ -1534,44 +1658,59 @@ def disable_startup(item: Dict[str, Any]) -> Tuple[bool, str]:
     if item.get("kind") == "registry":
         if not HAS_WINREG:
             return False, "winreg недоступен"
+        root_name = item["root"]
+        view = int(item.get("view", 0))
+        backup = {
+            "id": backup_id, "kind": "registry", "name": item["name"],
+            "root": root_name, "view": view, "source": item["source"],
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "data": _encode_registry_value(item["value"], item["reg_type"]),
+        }
+        # Сначала записываем бэкап
+        backups.append(backup)
+        if not save_json(STARTUP_BACKUP_FILE, backups):
+            backups.pop()
+            return False, "Не удалось сохранить бэкап"
+        # Затем удаляем запись
         try:
-            root_name = item["root"]
-            view = int(item.get("view", 0))
-            backup = {
-                "id": backup_id, "kind": "registry", "name": item["name"],
-                "root": root_name, "view": view, "source": item["source"],
-                "created": datetime.now().isoformat(timespec="seconds"),
-                "data": _encode_registry_value(item["value"], item["reg_type"]),
-            }
             with winreg.OpenKey(registry_root(root_name), STARTUP_RUN_PATH, 0,
                                 winreg.KEY_SET_VALUE | view) as key:
                 winreg.DeleteValue(key, item["name"])
-            backups.append(backup)
-            save_json(STARTUP_BACKUP_FILE, backups)
             return True, "Запись отключена"
         except Exception as exc:
-            logging.exception("Ошибка отключения автозагрузки")
+            log.exception("Ошибка отключения автозагрузки")
+            # Откатываем бэкап
+            backups = [b for b in backups if b.get("id") != backup_id]
+            save_json(STARTUP_BACKUP_FILE, backups)
             return False, str(exc)
 
     if item.get("kind") == "file":
         source = normalize_path(item.get("path", ""))
-        if not os.path.isfile(source):
+        if not source or not os.path.isfile(source):
             return False, "Файл не найден"
         target = os.path.join(
             str(STARTUP_BACKUP_DIR),
             f"{backup_id}_{safe_filename(os.path.basename(source))}"
         )
+        # Сначала пробуем перенести — если упадёт, бэкап не нужен
         try:
             shutil.move(source, target)
-            backups.append({
-                "id": backup_id, "kind": "file", "name": item["name"],
-                "original_path": source, "backup_path": target,
-                "created": datetime.now().isoformat(timespec="seconds"),
-            })
-            save_json(STARTUP_BACKUP_FILE, backups)
-            return True, "Файл отключён"
         except Exception as exc:
             return False, str(exc)
+        # Записываем бэкап; если не сохранится, откатываем файл обратно
+        backups.append({
+            "id": backup_id, "kind": "file", "name": item["name"],
+            "original_path": source, "backup_path": target,
+            "created": datetime.now().isoformat(timespec="seconds"),
+        })
+        if not save_json(STARTUP_BACKUP_FILE, backups):
+            try:
+                shutil.move(target, source)
+            except Exception:
+                log.exception("Не удалось откатить перенос файла")
+            backups.pop()
+            return False, "Не удалось сохранить бэкап"
+        return True, "Файл отключён"
     return False, "Неизвестный тип"
 
 
@@ -1612,20 +1751,23 @@ def load_json(path, default):
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
-        logging.exception("Не удалось прочитать JSON: %s", path)
+        log.exception("Не удалось прочитать JSON: %s", path)
         return default
 
 
 def save_json(path, data) -> bool:
-    tmp = str(path) + ".tmp"
+    path_str = str(path)
+    directory = os.path.dirname(path_str)
+    tmp = path_str + ".tmp"
     try:
-        os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        os.replace(tmp, path_str)
         return True
     except Exception:
-        logging.exception("Не удалось сохранить JSON: %s", path)
+        log.exception("Не удалось сохранить JSON: %s", path)
         try:
             if os.path.isfile(tmp):
                 os.remove(tmp)
@@ -1666,7 +1808,8 @@ class FileTableModel(QAbstractTableModel):
         if not normalized_paths:
             return
         self.beginResetModel()
-        self._files = [f for f in self._files if f.normalized_path not in normalized_paths]
+        self._files = [f for f in self._files
+                       if f.normalized_path not in normalized_paths]
         self.endResetModel()
 
     def file_at(self, row: int) -> Optional[FileInfo]:
@@ -1740,7 +1883,9 @@ class FileFilterProxy(QSortFilterProxyModel):
         f = model.file_at(source_row)
         if f is None:
             return False
-        if self._folder_norm and not is_child_of(f.normalized_path, self._folder_norm):
+        if self._folder_norm and not is_inside(f.normalized_path,
+                                               self._folder_norm,
+                                               allow_equal=True):
             return False
         if self._category and f.category != self._category:
             return False
@@ -1773,6 +1918,7 @@ class ScanWorker(QThread):
         except ScanCanceled:
             self.canceled.emit()
         except Exception as exc:
+            log.exception("Ошибка сканирования")
             self.finished_err.emit(str(exc))
         else:
             self.finished_ok.emit(result)
@@ -1818,10 +1964,11 @@ class WorkerThread(QThread):
                                        int(self.payload.get("min_mb", 20)),
                                        self.token, self.report)
             elif op == "folder_sizes":
-                data = get_folder_sizes(self.payload.get("root", ""),
-                                        lambda: self.token.cancelled(),
-                                        lambda i, t, p: self.report(
-                                            f"Анализ {i+1}/{t}: {os.path.basename(p)}"))
+                data = get_folder_sizes(
+                    self.payload.get("root", ""),
+                    lambda: self.token.cancelled(),
+                    lambda i, t, p: self.report(
+                        f"Анализ {i+1}/{t}: {os.path.basename(p)}"))
             elif op == "processes":
                 data = list_processes()
             elif op == "startup":
@@ -1834,7 +1981,7 @@ class WorkerThread(QThread):
                 raise RuntimeError(f"Неизвестная операция: {op}")
             self.completed.emit(op, data)
         except Exception as exc:
-            logging.exception("Ошибка фоновой операции %s", self.operation)
+            log.exception("Ошибка фоновой операции %s", self.operation)
             self.failed.emit(self.operation, str(exc))
 
 
@@ -1882,6 +2029,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_ui()
         self._apply_style()
+        self._restore_geometry()
 
         QTimer.singleShot(300, self._refresh_dashboard)
 
@@ -1922,7 +2070,8 @@ class MainWindow(QMainWindow):
         self.addAction(act_cancel)
 
     def _show_about(self) -> None:
-        trash_note = "включена (send2trash)" if HAS_SEND2TRASH else "недоступна — удаление безвозвратное"
+        trash_note = ("включена (send2trash)" if HAS_SEND2TRASH
+                      else "недоступна — удаление безвозвратное")
         QMessageBox.about(
             self, "О программе",
             f"{APP_NAME} v{APP_VERSION}\n\n"
@@ -1968,7 +2117,6 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Готово")
 
-        # Общая строка прогресса / отмены
         status_widget = QWidget()
         status_layout = QHBoxLayout(status_widget)
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -2020,6 +2168,27 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background: #4f8cff; color: white; }
         """)
 
+    # ------------------------------------------------------------- Geometry
+    def _restore_geometry(self) -> None:
+        geo = SETTINGS["geometry"]
+        state = SETTINGS["window_state"]
+        try:
+            if geo:
+                from PyQt6.QtCore import QByteArray
+                self.restoreGeometry(QByteArray(geo))
+            if state:
+                from PyQt6.QtCore import QByteArray
+                self.restoreState(QByteArray(state))
+        except Exception:
+            log.exception("Не удалось восстановить геометрию окна")
+
+    def _save_geometry(self) -> None:
+        try:
+            SETTINGS["geometry"] = bytes(self.saveGeometry()).decode("latin-1")
+            SETTINGS["window_state"] = bytes(self.saveState()).decode("latin-1")
+        except Exception:
+            log.exception("Не удалось сохранить геометрию окна")
+
     # ------------------------------------------------------------- Dashboard
     def _build_dashboard_tab(self) -> None:
         tab = QWidget()
@@ -2036,7 +2205,7 @@ class MainWindow(QMainWindow):
         self._dash_mem,    self._dash_mem_val    = self._make_metric("Оперативная память")
         self._dash_cpu,    self._dash_cpu_val    = self._make_metric("CPU")
         self._dash_clean,  self._dash_clean_val  = self._make_metric("Последняя очистка")
-        self._dash_freed,  self._dash_freed_val  = self._make_metric("Освобождено")
+        self._dash_freed,  self._dash_freed_val  = self._make_metric("Освобождено (последняя)")
 
         grid.addWidget(self._dash_health, 0, 0)
         grid.addWidget(self._dash_disk,   0, 1)
@@ -2054,7 +2223,8 @@ class MainWindow(QMainWindow):
 
         self._warning_tree = QTreeWidget()
         self._warning_tree.setHeaderLabels(["Предупреждения"])
-        self._warning_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._warning_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self._warning_tree)
 
         row = QHBoxLayout()
@@ -2092,7 +2262,8 @@ class MainWindow(QMainWindow):
         self._health_bar.setValue(score)
         disk_free = data.get("disk_free")
         disk_total = data.get("disk_total")
-        self._dash_disk_val.setText(human_size(disk_free) if disk_free is not None else "N/A")
+        self._dash_disk_val.setText(
+            human_size(disk_free) if disk_free is not None else "N/A")
         if disk_total is not None:
             self._dash_disk.setToolTip(f"Всего: {human_size(disk_total)}")
         mem = data.get("memory")
@@ -2117,10 +2288,10 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(8, 8, 8, 8)
 
-        # Верхняя панель
         top = QVBoxLayout()
         path_row = QHBoxLayout()
-        self._path_edit = QLineEdit(SETTINGS["last_scan_path"] or os.path.expanduser("~"))
+        self._path_edit = QLineEdit(
+            SETTINGS["last_scan_path"] or os.path.expanduser("~"))
         self._path_edit.setPlaceholderText("Путь к диску или папке…")
         self._path_edit.setClearButtonEnabled(True)
         browse = QPushButton("📂 Обзор…")
@@ -2161,7 +2332,6 @@ class MainWindow(QMainWindow):
         top.addWidget(self._disk_progress)
         outer.addLayout(top)
 
-        # Сплиттер: слева дерево + категории, справа таблица
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         left = QWidget()
@@ -2180,8 +2350,10 @@ class MainWindow(QMainWindow):
         self._tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._tree.itemSelectionChanged.connect(self._on_tree_selection)
         self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self._tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._tree.header().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents)
+        self._tree.header().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents)
         tree_layout.addWidget(self._tree)
 
         cat_wrap = QWidget()
@@ -2189,12 +2361,16 @@ class MainWindow(QMainWindow):
         cat_layout.setContentsMargins(0, 0, 0, 0)
         cat_layout.addWidget(QLabel("Категории"))
         self._category_table = QTableWidget(0, 4)
-        self._category_table.setHorizontalHeaderLabels(["Категория", "Файлов", "Размер", "%"])
+        self._category_table.setHorizontalHeaderLabels(
+            ["Категория", "Файлов", "Размер", "%"])
         self._category_table.verticalHeader().setVisible(False)
-        self._category_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._category_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._category_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._category_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection)
         self._category_table.setAlternatingRowColors(True)
-        self._category_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._category_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
         for i in (1, 2, 3):
             self._category_table.horizontalHeader().setSectionResizeMode(
                 i, QHeaderView.ResizeMode.ResizeToContents)
@@ -2206,7 +2382,6 @@ class MainWindow(QMainWindow):
         left_splitter.setStretchFactor(1, 2)
         left_layout.addWidget(left_splitter)
 
-        # Правая часть — таблица файлов
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -2214,8 +2389,10 @@ class MainWindow(QMainWindow):
         self._table = QTableView()
         self._table.setModel(self._proxy)
         self._table.setAlternatingRowColors(True)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSortingEnabled(True)
         self._table.verticalHeader().setVisible(False)
@@ -2297,10 +2474,12 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Сканирование диска…")
 
     def _on_disk_progress(self, files: int, size: int, path: str) -> None:
-        elapsed = time.monotonic() - self._scan_start_time if self._scan_start_time else 0
+        elapsed = (time.monotonic() - self._scan_start_time
+                   if self._scan_start_time else 0)
         rate = files / elapsed if elapsed > 0.5 else 0
         rate_part = f" | {rate:.0f} ф/с" if rate > 0 else ""
-        self._disk_progress.setFormat(f"Файлов: {files} | {human_size(size)}{rate_part}")
+        self._disk_progress.setFormat(
+            f"Файлов: {files} | {human_size(size)}{rate_part}")
         self.status_bar.showMessage(f"Сканирование: {path}")
 
     def _on_disk_finished(self, result: ScanResult) -> None:
@@ -2323,10 +2502,12 @@ class MainWindow(QMainWindow):
         self._op_label.setText("Готово")
 
         elapsed = time.monotonic() - self._scan_start_time
-        err_part = f" | Ошибок доступа: {result.scan_errors}" if result.scan_errors else ""
+        err_part = (f" | Ошибок доступа: {result.scan_errors}"
+                    if result.scan_errors else "")
         self._disk_summary.setText(
             f"Файлов: {result.total_files} | Папок: {len(result.folder_stats)} | "
-            f"Размер: {human_size(result.total_bytes)} | Время: {elapsed:.1f} с{err_part}"
+            f"Размер: {human_size(result.total_bytes)} | "
+            f"Время: {elapsed:.1f} с{err_part}"
         )
         self._update_statusbar()
         self._cleanup_scan_worker()
@@ -2354,24 +2535,28 @@ class MainWindow(QMainWindow):
             self._scan_worker.deleteLater()
             self._scan_worker = None
 
-    def _build_tree(self, folder_stats: Dict[str, FolderStats], root_display: str) -> None:
+    def _build_tree(self, folder_stats: Dict[str, FolderStats],
+                    root_display: str) -> None:
         self._tree.blockSignals(True)
         self._tree.clear()
         root_key = normalize_path(root_display)
         nodes: Dict[str, QTreeWidgetItem] = {}
-        root_stats = folder_stats.get(root_key) or FolderStats(display=root_display, parent_key=None)
+        root_stats = (folder_stats.get(root_key)
+                      or FolderStats(display=root_display, parent_key=None))
         root_item = QTreeWidgetItem([
             root_stats.display, str(root_stats.count), human_size(root_stats.size_bytes)
         ])
         root_item.setData(0, Qt.ItemDataRole.UserRole, root_stats.display)
-        bold = QFont(); bold.setBold(True)
+        bold = QFont()
+        bold.setBold(True)
         for col in range(3):
             root_item.setFont(col, bold)
         self._tree.addTopLevelItem(root_item)
         nodes[root_key] = root_item
 
         for key, stats in sorted(folder_stats.items(),
-                                 key=lambda kv: path_depth(kv[1].display, root_display)):
+                                 key=lambda kv: path_depth(kv[1].display,
+                                                           root_display)):
             if key == root_key or key in nodes:
                 continue
             parent_key = stats.parent_key or root_key
@@ -2400,14 +2585,16 @@ class MainWindow(QMainWindow):
             pct = stats.size_bytes / total * 100
             self._category_table.setItem(row, 0, QTableWidgetItem(cat))
             self._category_table.setItem(row, 1, QTableWidgetItem(str(stats.count)))
-            self._category_table.setItem(row, 2, QTableWidgetItem(human_size(stats.size_bytes)))
+            self._category_table.setItem(row, 2, QTableWidgetItem(
+                human_size(stats.size_bytes)))
             self._category_table.setItem(row, 3, QTableWidgetItem(f"{pct:.1f}%"))
 
     def _on_tree_selection(self) -> None:
         if not self._root_display:
             return
         items = self._tree.selectedItems()
-        folder = items[0].data(0, Qt.ItemDataRole.UserRole) if items else self._root_display
+        folder = (items[0].data(0, Qt.ItemDataRole.UserRole)
+                  if items else self._root_display)
         self._current_folder = folder or self._root_display
         self._proxy.set_folder_filter(self._current_folder)
         self._update_statusbar()
@@ -2501,23 +2688,64 @@ class MainWindow(QMainWindow):
         files = self._selected_files()
         if not files:
             return
-        verb = "переместить в корзину" if HAS_SEND2TRASH else "БЕЗВОЗВРАТНО удалить"
-        names = "\n".join(f.name for f in files[:10])
-        more = f"\n… и ещё {len(files) - 10}" if len(files) > 10 else ""
+        # Безопасный режим: если включён — всегда в корзину (когда доступна)
+        safe_mode = bool(SETTINGS["safe_mode"])
+        use_trash = HAS_SEND2TRASH or safe_mode
+        if safe_mode and not HAS_SEND2TRASH:
+            QMessageBox.warning(
+                self, "Безопасный режим",
+                "Безопасный режим включён, но send2trash не установлен.\n"
+                "Удаление безвозвратное. Отключите безопасный режим "
+                "или установите send2trash.")
+            return
+
+        # Проверяем каждый файл на защиту
+        protected_files: List[Tuple[FileInfo, str]] = []
+        for f in files:
+            # Проверка относительно корня сканирования, если он известен
+            root = self._root_display or os.path.dirname(f.path)
+            valid, reason = validate_delete_path(f.path, root)
+            if not valid:
+                protected_files.append((f, reason))
+
+        allowed = [f for f in files if f not in [pf[0] for pf in protected_files]]
+
+        if protected_files:
+            details = "\n".join(f"• {f.name}: {r}" for f, r in protected_files[:10])
+            more = (f"\n… и ещё {len(protected_files) - 10}"
+                    if len(protected_files) > 10 else "")
+            QMessageBox.warning(
+                self, "Защищённые файлы",
+                f"Следующие файлы будут пропущены (защита):\n\n{details}{more}")
+        if not allowed:
+            return
+
+        verb = ("переместить в корзину" if use_trash
+                else "БЕЗВОЗВРАТНО удалить")
+        names = "\n".join(f.name for f in allowed[:10])
+        more = f"\n… и ещё {len(allowed) - 10}" if len(allowed) > 10 else ""
         answer = QMessageBox.question(
             self, "Подтверждение удаления",
-            f"Вы уверены, что хотите {verb} {len(files)} файл(ов)?\n\n{names}{more}",
+            f"Вы уверены, что хотите {verb} {len(allowed)} файл(ов)?\n\n"
+            f"{names}{more}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+
         deleted, errors = [], []
-        for f in files:
+        for f in allowed:
             try:
-                if HAS_SEND2TRASH:
+                # Финальная проверка защиты непосредственно перед удалением
+                ok, reason = is_protected(f.path)
+                if ok:
+                    errors.append(f"{f.name}: {reason}")
+                    continue
+                if use_trash and HAS_SEND2TRASH:
                     _send2trash(f.path)
                 else:
+                    _make_writable(f.path)
                     os.remove(f.path)
                 deleted.append(f)
             except Exception as exc:
@@ -2534,17 +2762,22 @@ class MainWindow(QMainWindow):
         touched: Set[str] = set()
         for f in deleted:
             key = normalize_path(f.dir_path)
-            while key and key in self._folder_stats:
+            safety = 0
+            while key and key in self._folder_stats and safety < 10000:
                 stats = self._folder_stats[key]
-                stats.count -= 1
-                stats.size_bytes -= f.size
+                stats.count = max(0, stats.count - 1)
+                stats.size_bytes = max(0, stats.size_bytes - f.size)
                 touched.add(key)
-                key = stats.parent_key or ""
+                next_key = stats.parent_key
+                if not next_key or next_key == key:
+                    break
+                key = next_key
+                safety += 1
             cstats = self._category_stats.get(f.category)
             if cstats:
-                cstats.count -= 1
-                cstats.size_bytes -= f.size
-            self._total_bytes -= f.size
+                cstats.count = max(0, cstats.count - 1)
+                cstats.size_bytes = max(0, cstats.size_bytes - f.size)
+            self._total_bytes = max(0, self._total_bytes - f.size)
         for key in touched:
             item = self._tree_nodes.get(key)
             stats = self._folder_stats.get(key)
@@ -2571,7 +2804,8 @@ class MainWindow(QMainWindow):
                 ("privacy", "Кэши браузеров"), ("games", "Игровые кэши"),
                 ("recent", "Недавние документы")]
         for i, (key, txt) in enumerate(cats):
-            cb = QCheckBox(txt); cb.setChecked(True)
+            cb = QCheckBox(txt)
+            cb.setChecked(True)
             self._cleanup_checks[key] = cb
             cat_grid.addWidget(cb, i // 2, i % 2)
 
@@ -2609,7 +2843,8 @@ class MainWindow(QMainWindow):
 
         self._cleanup_tree = QTreeWidget()
         self._cleanup_tree.setAlternatingRowColors(True)
-        self._cleanup_tree.setHeaderLabels(["Удалить", "Категория", "Путь", "Размер", "Изменён"])
+        self._cleanup_tree.setHeaderLabels(
+            ["Удалить", "Категория", "Путь", "Размер", "Изменён"])
         for i, mode in enumerate([
             QHeaderView.ResizeMode.ResizeToContents,
             QHeaderView.ResizeMode.ResizeToContents,
@@ -2629,11 +2864,22 @@ class MainWindow(QMainWindow):
         if not cats:
             QMessageBox.information(self, "Очистка", "Выберите хотя бы одну категорию.")
             return
+        age = self._cleanup_age.value()
+        if age == 0:
+            ans = QMessageBox.warning(
+                self, "Возраст = 0",
+                "Будут показаны ВСЕ файлы выбранных категорий, включая свежие.\n"
+                "Продолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
         self._cleanup_tree.clear()
         self._preview_candidates = []
         self._delete_cleanup_btn.setEnabled(False)
         self._start_worker("cleanup_scan", {
-            "categories": cats, "age": self._cleanup_age.value()
+            "categories": cats, "age": age,
         })
 
     def _show_cleanup_preview(self, candidates: List[Candidate]) -> None:
@@ -2734,10 +2980,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", str(exc))
 
     def _request_recycle_cleanup(self) -> None:
-        size = recycle_size()
+        size, items = recycle_size()
         ans = QMessageBox.question(
             self, "Очистка корзины",
-            f"Приблизительный размер корзины: {human_size(size)}\n\nОчистить?",
+            f"Приблизительный размер корзины: {human_size(size)}\n"
+            f"Элементов: {items}\n\nОчистить?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if ans == QMessageBox.StandardButton.Yes:
@@ -2786,11 +3033,14 @@ class MainWindow(QMainWindow):
 
         self._fs_tree = QTreeWidget()
         self._fs_tree.setAlternatingRowColors(True)
-        self._fs_tree.setHeaderLabels(["Папка", "Размер", "% от общего", "Файлов", "Диаграмма"])
+        self._fs_tree.setHeaderLabels(
+            ["Папка", "Размер", "% от общего", "Файлов", "Диаграмма"])
         for i in (0, 4):
-            self._fs_tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+            self._fs_tree.header().setSectionResizeMode(
+                i, QHeaderView.ResizeMode.Stretch)
         for i in (1, 2, 3):
-            self._fs_tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+            self._fs_tree.header().setSectionResizeMode(
+                i, QHeaderView.ResizeMode.ResizeToContents)
         self._fs_tree.itemDoubleClicked.connect(self._on_fs_double_click)
         layout.addWidget(self._fs_tree)
 
@@ -2916,9 +3166,11 @@ class MainWindow(QMainWindow):
         self._dup_tree = QTreeWidget()
         self._dup_tree.setAlternatingRowColors(True)
         self._dup_tree.setHeaderLabels(["Группа / Путь", "Размер", "Доп."])
-        self._dup_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._dup_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
         for i in (1, 2):
-            self._dup_tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+            self._dup_tree.header().setSectionResizeMode(
+                i, QHeaderView.ResizeMode.ResizeToContents)
         self._dup_tree.itemDoubleClicked.connect(self._on_dup_double_click)
         layout.addWidget(self._dup_tree)
 
@@ -2934,34 +3186,40 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "Дубликаты")
 
     def _add_root_to(self, edit: QLineEdit) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку", get_user_profile())
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку", get_user_profile())
         if not folder:
             return
         current = edit.text().strip()
-        parts = [p.strip() for p in current.split(";") if p.strip()] if current else []
+        parts = ([p.strip() for p in current.split(";") if p.strip()]
+                 if current else [])
         if folder not in parts:
             parts.append(folder)
         edit.setText("; ".join(parts))
 
     def _parse_roots(self, text: str) -> List[str]:
         parts = re.split(r"[;\n]+", text)
-        return [normalize_path(p) for p in parts if p.strip() and os.path.isdir(p.strip())]
+        return [normalize_path(p) for p in parts
+                if p.strip() and os.path.isdir(p.strip())]
 
     def _start_dup_scan(self) -> None:
         if self._is_busy():
             return
         roots = self._parse_roots(self._dup_roots_edit.text())
         if not roots:
-            QMessageBox.information(self, "Инфо", "Укажите хотя бы одну существующую папку.")
+            QMessageBox.information(self, "Инфо",
+                                    "Укажите хотя бы одну существующую папку.")
             return
         self._dup_tree.clear()
-        self._start_worker("duplicates", {"roots": roots, "min_mb": self._dup_min_mb.value()})
+        self._start_worker("duplicates",
+                           {"roots": roots, "min_mb": self._dup_min_mb.value()})
 
     def _show_duplicates(self, groups: List[Dict[str, Any]]) -> None:
         self._dup_groups = groups
         self._dup_tree.clear()
         if not groups:
-            self._dup_tree.addTopLevelItem(QTreeWidgetItem(["Дубликаты не найдены", "", ""]))
+            self._dup_tree.addTopLevelItem(
+                QTreeWidgetItem(["Дубликаты не найдены", "", ""]))
             self._dup_summary.setText("Групп: 0")
             return
         for n, g in enumerate(groups, 1):
@@ -2971,7 +3229,8 @@ class MainWindow(QMainWindow):
                 f"Лишних: {human_size(g['wasted'])}",
             ])
             for path in g["files"]:
-                child = QTreeWidgetItem([path, human_size(g["size"]), g["hash"][:16] + "…"])
+                child = QTreeWidgetItem(
+                    [path, human_size(g["size"]), g["hash"][:16] + "…"])
                 child.setData(0, Qt.ItemDataRole.UserRole, path)
                 parent.addChild(child)
             parent.setExpanded(True)
@@ -2997,9 +3256,11 @@ class MainWindow(QMainWindow):
             return
         try:
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write(f"Отчёт о дубликатах — {datetime.now()}\n" + "=" * 60 + "\n\n")
+                fh.write(f"Отчёт о дубликатах — {datetime.now()}\n"
+                         + "=" * 60 + "\n\n")
                 for n, g in enumerate(self._dup_groups, 1):
-                    fh.write(f"#{n}  hash={g['hash']}  размер={human_size(g['size'])}\n")
+                    fh.write(f"#{n}  hash={g['hash']}  "
+                             f"размер={human_size(g['size'])}\n")
                     for p in g["files"]:
                         fh.write(f"  {p}\n")
                     fh.write("\n")
@@ -3042,11 +3303,14 @@ class MainWindow(QMainWindow):
         self._large_tree = QTreeWidget()
         self._large_tree.setAlternatingRowColors(True)
         self._large_tree.setHeaderLabels(["Путь", "Размер", "Изменён"])
-        self._large_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._large_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
         for i in (1, 2):
-            self._large_tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+            self._large_tree.header().setSectionResizeMode(
+                i, QHeaderView.ResizeMode.ResizeToContents)
         self._large_tree.itemDoubleClicked.connect(
-            lambda it, _c: open_in_explorer(it.data(0, Qt.ItemDataRole.UserRole) or ""))
+            lambda it, _c: open_in_explorer(
+                it.data(0, Qt.ItemDataRole.UserRole) or ""))
         layout.addWidget(self._large_tree)
 
         bottom = QHBoxLayout()
@@ -3065,10 +3329,12 @@ class MainWindow(QMainWindow):
             return
         roots = self._parse_roots(self._large_roots_edit.text())
         if not roots:
-            QMessageBox.information(self, "Инфо", "Укажите хотя бы одну существующую папку.")
+            QMessageBox.information(self, "Инфо",
+                                    "Укажите хотя бы одну существующую папку.")
             return
         self._large_tree.clear()
-        self._start_worker("big_files", {"roots": roots, "min_mb": self._large_min_mb.value()})
+        self._start_worker("big_files",
+                           {"roots": roots, "min_mb": self._large_min_mb.value()})
 
     def _show_large(self, items: List[Dict[str, Any]]) -> None:
         self._large_items = items
@@ -3121,7 +3387,8 @@ class MainWindow(QMainWindow):
 
         self._proc_tree = QTreeWidget()
         self._proc_tree.setAlternatingRowColors(True)
-        self._proc_tree.setHeaderLabels(["PID", "Имя", "Память", "Статус", "Пользователь"])
+        self._proc_tree.setHeaderLabels(
+            ["PID", "Имя", "Память", "Статус", "Пользователь"])
         for i, mode in enumerate([
             QHeaderView.ResizeMode.ResizeToContents,
             QHeaderView.ResizeMode.Stretch,
@@ -3138,7 +3405,8 @@ class MainWindow(QMainWindow):
     def _show_processes(self, procs: List[Dict[str, Any]]) -> None:
         self._proc_tree.clear()
         if not procs:
-            self._proc_tree.addTopLevelItem(QTreeWidgetItem(["—", "psutil не установлен", "", "", ""]))
+            self._proc_tree.addTopLevelItem(
+                QTreeWidgetItem(["—", "psutil не установлен", "", "", ""]))
             return
         for p in procs:
             it = QTreeWidgetItem([
@@ -3195,7 +3463,8 @@ class MainWindow(QMainWindow):
 
         self._startup_tree = QTreeWidget()
         self._startup_tree.setAlternatingRowColors(True)
-        self._startup_tree.setHeaderLabels(["Тип", "Имя", "Источник", "Команда / Путь"])
+        self._startup_tree.setHeaderLabels(
+            ["Тип", "Имя", "Источник", "Команда / Путь"])
         for i, mode in enumerate([
             QHeaderView.ResizeMode.ResizeToContents,
             QHeaderView.ResizeMode.ResizeToContents,
@@ -3249,18 +3518,23 @@ class MainWindow(QMainWindow):
     def _restore_startup_backup(self) -> None:
         backups = load_json(STARTUP_BACKUP_FILE, [])
         if not isinstance(backups, list) or not backups:
-            QMessageBox.information(self, "Резервные копии", "Резервные копии отсутствуют.")
+            QMessageBox.information(self, "Резервные копии",
+                                    "Резервные копии отсутствуют.")
             return
-        labels = [
-            f"{b.get('name', '—')} | {b.get('kind', '—')} | "
-            f"{b.get('created', '—')} | {b.get('id', '')}"
-            for b in backups
-        ]
+        labels: List[str] = []
+        id_by_label: Dict[str, str] = {}
+        for b in backups:
+            label = (f"{b.get('name', '—')} | {b.get('kind', '—')} | "
+                     f"{b.get('created', '—')} | {b.get('id', '')}")
+            labels.append(label)
+            id_by_label[label] = b.get("id", "")
         selected, accepted = QInputDialog.getItem(
             self, "Восстановление автозагрузки", "Выберите:", labels, 0, False)
         if not accepted or not selected:
             return
-        bid = backups[labels.index(selected)].get("id")
+        bid = id_by_label.get(selected, "")
+        if not bid:
+            return
         ok, msg = restore_startup(bid)
         if ok:
             QMessageBox.information(self, "Восстановление", msg)
@@ -3279,7 +3553,8 @@ class MainWindow(QMainWindow):
 
         grid = QGridLayout()
 
-        self._set_safe_mode = QCheckBox("Безопасный режим (сначала сканировать)")
+        self._set_safe_mode = QCheckBox(
+            "Безопасный режим (удаление через корзину, если доступно)")
         self._set_safe_mode.setChecked(bool(SETTINGS["safe_mode"]))
         grid.addWidget(self._set_safe_mode, 0, 0, 1, 2)
 
@@ -3305,6 +3580,10 @@ class MainWindow(QMainWindow):
         self._set_exts = QLineEdit(", ".join(SETTINGS["keep_extensions"]))
         grid.addWidget(self._set_exts, 4, 1)
 
+        grid.addWidget(QLabel("Игнорируемые папки:"), 5, 0)
+        self._set_ignore = QLineEdit(", ".join(SETTINGS["ignore_dirs"]))
+        grid.addWidget(self._set_ignore, 5, 1)
+
         layout.addLayout(grid)
 
         prot_box = QGroupBox("Дополнительно защищённые папки")
@@ -3318,7 +3597,9 @@ class MainWindow(QMainWindow):
         add_p.clicked.connect(self._add_protected_folder)
         clear_p = QPushButton("🗑 Очистить")
         clear_p.clicked.connect(self._clear_protected_folders)
-        prot_btns.addWidget(add_p); prot_btns.addWidget(clear_p); prot_btns.addStretch()
+        prot_btns.addWidget(add_p)
+        prot_btns.addWidget(clear_p)
+        prot_btns.addStretch()
         prot_layout.addLayout(prot_btns)
         layout.addWidget(prot_box)
         self._refresh_prot_list()
@@ -3330,13 +3611,15 @@ class MainWindow(QMainWindow):
         open_rep.clicked.connect(lambda: open_in_explorer(str(REPORT_DIR)))
         open_log = QPushButton("📄 Открыть логи")
         open_log.clicked.connect(lambda: open_in_explorer(str(LOG_DIR)))
-        bottom.addWidget(save); bottom.addWidget(open_rep); bottom.addWidget(open_log)
+        bottom.addWidget(save)
+        bottom.addWidget(open_rep)
+        bottom.addWidget(open_log)
         bottom.addStretch()
         layout.addLayout(bottom)
 
         info = QLabel(
-            "Программа не проходит через junction, symlink и другие reparse points; "
-            "не удаляет системные файлы и критичные расширения. "
+            "Программа не проходит через junction, symlink и другие reparse "
+            "points; не удаляет системные файлы и критичные расширения. "
             f"Настройки хранятся в {CONFIG_FILE}."
         )
         info.setWordWrap(True)
@@ -3347,9 +3630,14 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "Настройки")
 
     def _add_protected_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Папка, которую НИКОГДА не удалять")
-        if folder and folder not in SETTINGS["custom_protected"]:
-            SETTINGS["custom_protected"].append(folder)
+        folder = QFileDialog.getExistingDirectory(
+            self, "Папка, которую НИКОГДА не удалять")
+        if not folder:
+            return
+        current = list(SETTINGS["custom_protected"])
+        if folder not in current:
+            current.append(folder)
+            SETTINGS["custom_protected"] = current
             self._refresh_prot_list()
             SETTINGS.save()
 
@@ -3360,9 +3648,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_prot_list(self) -> None:
         self._prot_list.clear()
-        for p in SETTINGS["custom_protected"]:
+        items = SETTINGS["custom_protected"]
+        for p in items:
             self._prot_list.addTopLevelItem(QTreeWidgetItem([p]))
-        if not SETTINGS["custom_protected"]:
+        if not items:
             self._prot_list.addTopLevelItem(QTreeWidgetItem(["(пусто)"]))
 
     def _save_ui_settings(self) -> None:
@@ -3370,9 +3659,18 @@ class MainWindow(QMainWindow):
         SETTINGS["min_age_hours"] = self._set_age.value()
         SETTINGS["big_file_mb"] = self._set_big.value()
         SETTINGS["duplicate_mb"] = self._set_dup.value()
-        SETTINGS["keep_extensions"] = [
-            (e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower())
-            for e in self._set_exts.text().split(",") if e.strip()
+        exts = [_normalize_extension(e)
+                for e in self._set_exts.text().split(",") if e.strip()]
+        exts = [e for e in exts if e]
+        if not exts:
+            QMessageBox.warning(
+                self, "Ошибка",
+                "Список защищённых расширений не может быть пустым.")
+            return
+        SETTINGS["keep_extensions"] = exts
+        SETTINGS["ignore_dirs"] = [
+            s.strip().lower()
+            for s in self._set_ignore.text().split(",") if s.strip()
         ]
         if SETTINGS.save():
             QMessageBox.information(self, "Настройки", "Настройки сохранены.")
@@ -3381,10 +3679,11 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------- Общий воркер-API
     def _is_busy(self) -> bool:
-        return (self._worker is not None and self._worker.isRunning()) or \
-               (self._scan_worker is not None and self._scan_worker.isRunning())
+        return ((self._worker is not None and self._worker.isRunning()) or
+                (self._scan_worker is not None and self._scan_worker.isRunning()))
 
-    def _start_worker(self, operation: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    def _start_worker(self, operation: str,
+                      payload: Optional[Dict[str, Any]] = None) -> None:
         if self._is_busy():
             QMessageBox.information(self, "Операция выполняется",
                                     "Дождитесь завершения текущей операции.")
@@ -3417,7 +3716,8 @@ class MainWindow(QMainWindow):
 
     def _on_worker_failed(self, operation: str, message: str) -> None:
         QMessageBox.critical(self, "Ошибка",
-                             f"Операция «{operation}» завершилась ошибкой:\n\n{message}")
+                             f"Операция «{operation}» завершилась ошибкой:\n\n"
+                             f"{message}")
         self.status_bar.showMessage("Ошибка операции")
 
     def _on_worker_completed(self, operation: str, data: Any) -> None:
@@ -3496,6 +3796,12 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- Закрытие
     def closeEvent(self, event) -> None:
+        # Сохраняем настройки до любых проверок
+        if hasattr(self, "_path_edit"):
+            SETTINGS["last_scan_path"] = self._path_edit.text()
+        self._save_geometry()
+        SETTINGS.save()
+
         if self._scan_worker and self._scan_worker.isRunning():
             ans = QMessageBox.question(
                 self, "Сканирование выполняется",
@@ -3507,7 +3813,9 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self._scan_worker.request_stop()
-            self._scan_worker.wait()
+            if not self._scan_worker.wait(5000):
+                log.warning("ScanWorker не завершился за 5 секунд")
+
         if self._worker and self._worker.isRunning():
             ans = QMessageBox.question(
                 self, "Операция выполняется",
@@ -3515,15 +3823,49 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
-            if ans == QMessageBox.StandardButton.Yes:
-                self._worker.cancel()
-            event.ignore()
-            return
+            if ans != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._worker.cancel()
+            if not self._worker.wait(5000):
+                log.warning("WorkerThread не завершился за 5 секунд")
 
-        if hasattr(self, "_path_edit"):
-            SETTINGS["last_scan_path"] = self._path_edit.text()
-        SETTINGS.save()
         event.accept()
+
+
+# ============================================================================
+#  SINGLE INSTANCE
+# ============================================================================
+class SingleInstanceGuard:
+    """Проверка единственного экземпляра через QSharedMemory + QLockFile."""
+
+    def __init__(self, key: str = "PCOptimizerCombined") -> None:
+        self._key = key
+        self._shared = QSharedMemory(key)
+        self._lock = QLockFile(str(APP_DATA_DIR / "app.lock"))
+        self._lock.setStaleLockTime(0)
+
+    def acquire(self) -> bool:
+        # Сначала пытаемся создать shared memory
+        if self._shared.attach():
+            self._shared.detach()
+        if not self._shared.create(1):
+            return False
+        if not self._lock.tryLock(100):
+            self._shared.detach()
+            return False
+        return True
+
+    def release(self) -> None:
+        try:
+            self._lock.unlock()
+        except Exception:
+            pass
+        try:
+            if self._shared.isAttached():
+                self._shared.detach()
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -3535,9 +3877,18 @@ def main() -> int:
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName(ORG_NAME)
 
-    window = MainWindow()
-    window.show()
-    return app.exec()
+    guard = SingleInstanceGuard()
+    if not guard.acquire():
+        QMessageBox.warning(None, APP_NAME,
+                            "Программа уже запущена.")
+        return 1
+
+    try:
+        window = MainWindow()
+        window.show()
+        return app.exec()
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":
